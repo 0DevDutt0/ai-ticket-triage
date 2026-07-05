@@ -1,0 +1,123 @@
+{
+  "name": "WF2 - Ticket Lifecycle & Audit Trail",
+  "nodes": [
+    {
+      "parameters": {
+        "authentication": "airtableTokenApi",
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "baseId": "app1iEDHz2HsvKynN",
+        "tableId": "tblf5GXP6JDw6G3GN",
+        "triggerField": "Last Updated",
+        "additionalFields": {}
+      },
+      "id": "wf2-airtable-trigger",
+      "name": "Airtable Trigger (Last Updated)",
+      "type": "n8n-nodes-base.airtableTrigger",
+      "typeVersion": 1,
+      "position": [0, 0],
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- Step 10: diff watched fields against last snapshot -> one item per change ----\n// NOTE: $getWorkflowStaticData persists only when the workflow is ACTIVE (production runs),\n// not in manual test runs. First sighting of a record only seeds the snapshot (no log spam).\nconst sd = $getWorkflowStaticData('global');\nsd.snapshots = sd.snapshots || {};\nconst WATCH = ['Status', 'Priority', 'Category', 'Assigned Team', 'Internal Notes'];\nconst VALID_STATUS = ['Open', 'In Progress', 'Waiting for Customer', 'Resolved', 'Closed'];\nconst out = [];\nfor (const item of $input.all()) {\n  const f = item.json.fields || item.json;\n  const rid = item.json.id;\n  if (!rid) continue;\n  const prev = sd.snapshots[rid];\n  if (prev) {\n    for (const field of WATCH) {\n      const oldV = prev[field] !== undefined && prev[field] !== null ? prev[field] : '';\n      const newV = f[field] !== undefined && f[field] !== null ? f[field] : '';\n      if (JSON.stringify(oldV) !== JSON.stringify(newV)) {\n        const illegalStatus = field === 'Status' && newV && !VALID_STATUS.includes(String(newV));\n        out.push({\n          json: {\n            recordId: rid,\n            ticketId: f['Ticket ID'] || '',\n            field,\n            oldValue: String(oldV),\n            newValue: String(newV),\n            changedBy: 'agent (via Airtable)',\n            illegalStatus,\n            statusNowResolved: field === 'Status' && String(newV) === 'Resolved',\n            statusNowWaiting: field === 'Status' && String(newV) === 'Waiting for Customer',\n            senderEmail: f['Sender Email'] || '',\n            customerName: f['Customer Name'] || 'there',\n            issueSummary: f['Issue Summary'] || '',\n          },\n        });\n      }\n    }\n  }\n  const snap = {};\n  for (const field of WATCH) snap[field] = f[field] !== undefined && f[field] !== null ? f[field] : '';\n  sd.snapshots[rid] = snap;\n}\nreturn out; // empty = nothing meaningful changed"
+      },
+      "id": "wf2-diff",
+      "name": "Diff Against Snapshot",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblPO9rQ3rULexIDF" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Ticket": "={{ [$json.recordId] }}",
+            "Field Changed": "={{ $json.field }}",
+            "Old Value": "={{ $json.oldValue }}",
+            "New Value": "={{ $json.newValue }}",
+            "Changed By": "={{ $json.changedBy }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": { "typecast": true }
+      },
+      "id": "wf2-audit-log",
+      "name": "Append Audit Log",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [440, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Diff Against Snapshot').item.json.statusNowResolved && !!$('Diff Against Snapshot').item.json.senderEmail }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf2-if-resolved",
+      "name": "Status -> Resolved?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Diff Against Snapshot').item.json.senderEmail }}",
+        "subject": "=[{{ $('Diff Against Snapshot').item.json.ticketId }}] Your support request has been resolved",
+        "emailType": "text",
+        "message": "=Hi {{ $('Diff Against Snapshot').item.json.customerName }},\n\nGood news - your support request has been marked as Resolved:\n\n  Ticket ID: {{ $('Diff Against Snapshot').item.json.ticketId }}\n  Summary:   {{ $('Diff Against Snapshot').item.json.issueSummary }}\n\nIf the issue is not fully fixed, just reply to this email within 7 days and we'll reopen the ticket. Otherwise it will be closed automatically.\n\n- Support Team",
+        "options": { "appendAttribution": false }
+      },
+      "id": "wf2-resolution-email",
+      "name": "Send Resolution Email",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [880, -80],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": { "gmailOAuth2": { "id": "5JpQggFa441vQuLb", "name": "Gmail account" } }
+    },
+    {
+      "parameters": {},
+      "id": "wf2-noop",
+      "name": "No Customer Email Needed",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [880, 100]
+    }
+  ],
+  "connections": {
+    "Airtable Trigger (Last Updated)": { "main": [[{ "node": "Diff Against Snapshot", "type": "main", "index": 0 }]] },
+    "Diff Against Snapshot": { "main": [[{ "node": "Append Audit Log", "type": "main", "index": 0 }]] },
+    "Append Audit Log": { "main": [[{ "node": "Status -> Resolved?", "type": "main", "index": 0 }]] },
+    "Status -> Resolved?": {
+      "main": [
+        [{ "node": "Send Resolution Email", "type": "main", "index": 0 }],
+        [{ "node": "No Customer Email Needed", "type": "main", "index": 0 }]
+      ]
+    }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "instanceId": "exported" },
+  "tags": []
+}

@@ -1,0 +1,79 @@
+{
+  "name": "WF3 - SLA Monitor & Escalation",
+  "nodes": [
+    {
+      "parameters": {
+        "rule": { "interval": [{ "field": "minutes", "minutesInterval": 15 }] }
+      },
+      "id": "wf3-schedule",
+      "name": "Every 15 Minutes",
+      "type": "n8n-nodes-base.scheduleTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblf5GXP6JDw6G3GN" },
+        "filterByFormula": "AND({Status}='Open', {Escalated}=0, DATETIME_DIFF(NOW(), {Received At}, 'hours') >= {SLA Hours})",
+        "returnAll": true,
+        "options": {}
+      },
+      "id": "wf3-find-breached",
+      "name": "Find SLA-Breached Tickets",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [220, 0],
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ---- Bump priority one level, mark escalated, append note ----\nconst f = $json.fields || {};\nconst order = ['Low', 'Medium', 'High', 'Critical'];\nconst cur = order.includes(f.Priority) ? f.Priority : 'Medium';\nconst next = order[Math.min(order.indexOf(cur) + 1, order.length - 1)];\nconst ageHours = f['Received At'] ? Math.round((Date.now() - new Date(f['Received At']).getTime()) / 36e5) : 0;\nconst note = `[SLA] ${new Date().toISOString()} auto-escalated ${cur} -> ${next} (no first response within ${f['SLA Hours']}h; ticket age ${ageHours}h)`;\nreturn {\n  json: {\n    id: $json.id,\n    ticketId: f['Ticket ID'] || '',\n    issueSummary: f['Issue Summary'] || '',\n    assignedTeam: f['Assigned Team'] || '',\n    newPriority: next,\n    notes: ((f['Internal Notes'] || '') + '\\n' + note).trim(),\n    ageHours,\n  },\n};"
+      },
+      "id": "wf3-compute",
+      "name": "Compute Escalation",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [440, 0]
+    },
+    {
+      "parameters": {
+        "operation": "update",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblf5GXP6JDw6G3GN" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "id": "={{ $json.id }}",
+            "Priority": "={{ $json.newPriority }}",
+            "Escalated": true,
+            "Internal Notes": "={{ $json.notes }}"
+          },
+          "matchingColumns": ["id"],
+          "schema": []
+        },
+        "options": { "typecast": true }
+      },
+      "id": "wf3-update",
+      "name": "Escalate Ticket",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [660, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    }
+  ],
+  "connections": {
+    "Every 15 Minutes": { "main": [[{ "node": "Find SLA-Breached Tickets", "type": "main", "index": 0 }]] },
+    "Find SLA-Breached Tickets": { "main": [[{ "node": "Compute Escalation", "type": "main", "index": 0 }]] },
+    "Compute Escalation": { "main": [[{ "node": "Escalate Ticket", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "instanceId": "exported" },
+  "tags": []
+}

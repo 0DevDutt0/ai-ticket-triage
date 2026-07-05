@@ -1,0 +1,323 @@
+{
+  "name": "WF1 - Support Ticket Intake",
+  "nodes": [
+    {
+      "parameters": {
+        "pollTimes": { "item": [{ "mode": "everyMinute" }] },
+        "simple": false,
+        "filters": { "labelIds": ["INBOX"], "q": "-label:processed" },
+        "options": { "downloadAttachments": true }
+      },
+      "id": "wf1-gmail-trigger",
+      "name": "Gmail Trigger",
+      "type": "n8n-nodes-base.gmailTrigger",
+      "typeVersion": 1.2,
+      "position": [0, 0],
+      "credentials": { "gmailOAuth2": { "id": "5JpQggFa441vQuLb", "name": "Gmail account" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ---- Step 1: extract email metadata + keep attachments as binary ----\nconst j = $json;\nconst parseAddr = (s) => {\n  if (!s) return { name: '', email: '' };\n  const m = String(s).match(/^\\s*\"?([^\"<]*)\"?\\s*<([^>]+)>\\s*$/);\n  if (m) return { name: m[1].trim(), email: m[2].trim().toLowerCase() };\n  return { name: '', email: String(s).trim().toLowerCase() };\n};\nconst fromRaw = (j.from && j.from.value && j.from.value[0])\n  ? { name: j.from.value[0].name || '', email: String(j.from.value[0].address || '').toLowerCase() }\n  : parseAddr((j.from && j.from.text) || (j.headers && j.headers.from) || j.From || '');\nlet body = j.text || j.textPlain || '';\nif (!body && (j.html || j.textHtml)) {\n  body = String(j.html || j.textHtml)\n    .replace(/<style[\\s\\S]*?<\\/style>/gi, '')\n    .replace(/<[^>]+>/g, ' ')\n    .replace(/\\s+/g, ' ')\n    .trim();\n}\nconst binary = $input.item.binary || {};\nreturn {\n  json: {\n    senderName: fromRaw.name,\n    senderEmail: fromRaw.email,\n    subject: j.subject || (j.headers && j.headers.subject) || '(no subject)',\n    body: body,\n    bodyForAI: body.slice(0, 8000),\n    messageId: String(j.id || j.messageId || ''),\n    threadId: String(j.threadId || ''),\n    receivedAt: j.date ? new Date(j.date).toISOString() : new Date().toISOString(),\n    attachmentNames: Object.values(binary).map(b => b.fileName || 'file').join(', ') || 'none',\n  },\n  binary: binary,\n};"
+      },
+      "id": "wf1-extract-meta",
+      "name": "Extract Metadata",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "operation": "search",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblf5GXP6JDw6G3GN" },
+        "filterByFormula": "={Message ID} = '{{ $json.messageId }}'",
+        "returnAll": false,
+        "limit": 1,
+        "options": {}
+      },
+      "id": "wf1-idempotency",
+      "name": "Idempotency Check",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [440, 0],
+      "alwaysOutputData": true,
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $json.id }}",
+              "rightValue": "",
+              "operator": { "type": "string", "operation": "empty", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf1-if-new",
+      "name": "New Email?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [660, 0]
+    },
+    {
+      "parameters": {},
+      "id": "wf1-skip",
+      "name": "Skip (Already Processed)",
+      "type": "n8n-nodes-base.noOp",
+      "typeVersion": 1,
+      "position": [880, 180]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ---- Step 2: build the LLM request (system prompt lives here) ----\nconst e = $('Extract Metadata').item.json;\nconst system = `You are a support-ticket triage engine for a SaaS company. You receive one\ncustomer support email and return ONLY a single valid JSON object - no\nmarkdown fences, no commentary, no keys other than those specified.\n\nOutput schema (all keys required; use null when unknown, never invent facts):\n{\n  \"customer_name\": string | null,\n  \"company\": string | null,\n  \"issue_summary\": string,            // max 2 sentences, plain language\n  \"detailed_description\": string,\n  \"category\": one of [\"Technical Support\",\"Billing\",\"Sales Inquiry\",\"Feature Request\",\"Bug Report\",\"Account Access\",\"Refund Request\",\"General Inquiry\"],\n  \"priority\": one of [\"Critical\",\"High\",\"Medium\",\"Low\"],\n  \"priority_justification\": string,   // 1 sentence citing evidence\n  \"sentiment\": one of [\"Positive\",\"Neutral\",\"Negative\"],\n  \"product\": string | null,\n  \"suggested_department\": one of [\"Technical Support\",\"Finance\",\"Sales\",\"Customer Success\",\"Product Team\"],\n  \"suggested_tags\": string[],         // 2-5 lowercase kebab-case tags\n  \"confidence_score\": number          // 0.0-1.0 certainty in category+priority\n}\n\nClassification rules:\n- Bug Report = something is broken/erroring; Technical Support = help using a working feature; Account Access = login, password, 2FA, lockout.\n- Refund Request only when the customer explicitly asks for money back; otherwise billing disputes are Billing.\n\nPriority rules (apply the highest that matches):\n- Critical: production outage, all users blocked, data loss, security incident, payment system down.\n- High: core feature broken for the customer, blocked workflow, explicit urgent deadline, legal/compliance threat, threat to cancel.\n- Medium: degraded experience with a workaround, billing questions, access issues for a single user.\n- Low: general questions, feature requests, feedback, sales inquiries.\n\nSentiment reflects the customer's tone, not the issue severity.\nLower confidence_score when the email is ambiguous, multi-issue, or in a language you had to translate.\nIf the email is spam or not a support request, use category \"General Inquiry\", priority \"Low\", and tag \"possible-spam\".`;\nconst user = `Analyze this support email.\\n\\nSENDER NAME: ${e.senderName}\\nSENDER EMAIL: ${e.senderEmail}\\nSUBJECT: ${e.subject}\\nRECEIVED: ${e.receivedAt}\\nATTACHMENTS: ${e.attachmentNames}\\n\\nBODY:\\n\"\"\"\\n${e.bodyForAI}\\n\"\"\"`;\nreturn {\n  json: {\n    requestBody: {\n      model: 'llama-3.3-70b-versatile',\n      temperature: 0,\n      max_tokens: 1024,\n      response_format: { type: 'json_object' },\n      messages: [\n        { role: 'system', content: system },\n        { role: 'user', content: user },\n      ],\n    },\n  },\n};"
+      },
+      "id": "wf1-build-prompt",
+      "name": "Build AI Request",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [880, -60]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.groq.com/openai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify($json.requestBody) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "wf1-groq",
+      "name": "AI Analysis (Groq)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, -60],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": { "httpHeaderAuth": { "id": "nZb9gqTDh5c3dxHd", "name": "Groq API (Header Auth)" } }
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "https://api.mistral.ai/v1/chat/completions",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ ...$('Build AI Request').item.json.requestBody, model: 'mistral-small-latest' }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "wf1-mistral",
+      "name": "AI Fallback (Mistral)",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1100, 140],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueErrorOutput",
+      "credentials": { "httpHeaderAuth": { "id": "uYJN5n6rFCOAVEPC", "name": "Mistral API (Header Auth)" } }
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ---- Step 5: validate & normalize AI output (must never throw) ----\nconst CATEGORIES = [\"Technical Support\",\"Billing\",\"Sales Inquiry\",\"Feature Request\",\"Bug Report\",\"Account Access\",\"Refund Request\",\"General Inquiry\"];\nconst PRIORITIES = [\"Critical\",\"High\",\"Medium\",\"Low\"];\nconst SENTIMENTS = [\"Positive\",\"Neutral\",\"Negative\"];\nconst DEPARTMENTS = [\"Technical Support\",\"Finance\",\"Sales\",\"Customer Success\",\"Product Team\"];\nconst TEAM_MAP = {\n  \"Technical Support\": \"Technical Support\",\n  \"Bug Report\": \"Technical Support\",\n  \"Account Access\": \"Technical Support\",\n  \"Billing\": \"Finance\",\n  \"Refund Request\": \"Finance\",\n  \"Sales Inquiry\": \"Sales\",\n  \"Feature Request\": \"Product Team\",\n  \"General Inquiry\": \"Customer Success\",\n};\nconst SLA_HOURS = { Critical: 2, High: 4, Medium: 24, Low: 48 };\n\nconst email = $('Extract Metadata').item.json;\nconst raw = $json;\n\nfunction safeParse(text) {\n  if (text && typeof text === 'object') return text;\n  if (typeof text !== 'string') return null;\n  let t = text.trim().replace(/^```(?:json)?\\s*/i, '').replace(/```\\s*$/, '');\n  try { return JSON.parse(t); } catch (_) {}\n  const m = t.match(/\\{[\\s\\S]*\\}/);\n  if (m) { try { return JSON.parse(m[0]); } catch (_) {} }\n  return null;\n}\n// Groq/Mistral are OpenAI-compatible: text lives at choices[0].message.content\nconst aiText = (raw.choices && raw.choices[0] && raw.choices[0].message && raw.choices[0].message.content) || raw.text || raw.output || raw;\nlet ai = safeParse(aiText);\n\nlet needsReview = false;\nconst notes = [];\nif (!ai) { ai = {}; needsReview = true; notes.push('AI response unparseable - defaults applied'); }\nif (ai && !ai.issue_summary && !ai.category) { ai = {}; needsReview = true; notes.push('AI output missing required keys - defaults applied'); }\n\nfunction normalizeEnum(value, allowed, fallback) {\n  if (typeof value !== 'string') { needsReview = true; return fallback; }\n  const v = value.trim().toLowerCase();\n  const hit = allowed.find(a => a.toLowerCase() === v)\n           || allowed.find(a => a.toLowerCase().includes(v) || v.includes(a.toLowerCase()));\n  if (!hit) { needsReview = true; notes.push(`Unknown value \"${value}\" -> \"${fallback}\"`); }\n  return hit || fallback;\n}\nconst category = normalizeEnum(ai.category, CATEGORIES, 'General Inquiry');\nlet priority = normalizeEnum(ai.priority, PRIORITIES, 'Medium');\nconst sentiment = normalizeEnum(ai.sentiment, SENTIMENTS, 'Neutral');\nconst suggestedDept = normalizeEnum(ai.suggested_department, DEPARTMENTS, 'Customer Success');\n\n// Business-rule priority overrides (never let AI downgrade these)\nconst bodyLC = `${email.subject} ${email.body}`.toLowerCase();\nconst ruleHits = [];\nif (/\\b(outage|down for everyone|data loss|security breach|hacked|cannot process payments)\\b/.test(bodyLC)) {\n  if (priority !== 'Critical') ruleHits.push(`rule: critical keyword -> Critical (was ${priority})`);\n  priority = 'Critical';\n} else if (/\\b(urgent|asap|immediately|escalate|cancel(?:ling)? (?:my|our) (?:account|subscription))\\b/.test(bodyLC)\n           && (priority === 'Medium' || priority === 'Low')) {\n  ruleHits.push(`rule: urgency keyword -> High (was ${priority})`);\n  priority = 'High';\n}\n\n// Tags: coerce, lowercase, kebab, dedupe, cap at 5\nlet tags = Array.isArray(ai.suggested_tags) ? ai.suggested_tags\n         : typeof ai.suggested_tags === 'string' ? ai.suggested_tags.split(',') : [];\ntags = [...new Set(\n  tags.map(t => String(t).trim().toLowerCase().replace(/\\s+/g, '-'))\n      .filter(t => t.length > 0 && t.length <= 40)\n)].slice(0, 5);\n\n// Email validation\nconst EMAIL_RE = /^[^\\s@]+@[^\\s@]+\\.[^\\s@]{2,}$/;\nconst senderEmail = EMAIL_RE.test(email.senderEmail || '') ? email.senderEmail : null;\nif (!senderEmail) { needsReview = true; notes.push('Invalid sender email - ack will be skipped'); }\n\nlet confidence = Number(ai.confidence_score);\nif (!Number.isFinite(confidence) || confidence < 0 || confidence > 1) confidence = 0.5;\nif (confidence < 0.6) { needsReview = true; notes.push(`Low confidence ${confidence}`); }\n\nconst customerName = (ai.customer_name || email.senderName || 'Unknown').toString().slice(0, 100);\nconst summary = (ai.issue_summary || email.subject || 'No summary available').toString().slice(0, 500);\n\nreturn {\n  json: {\n    ticketId: `TKT-${Date.now().toString(36).toUpperCase()}-${Math.random().toString(36).slice(2, 6).toUpperCase()}`,\n    customerName,\n    company: ai.company || '',\n    senderEmail: senderEmail || email.senderEmail || '',\n    validEmail: !!senderEmail,\n    subject: email.subject || '(no subject)',\n    body: email.body || '',\n    issueSummary: summary,\n    detailedDescription: ai.detailed_description || summary,\n    category, priority, sentiment,\n    priorityJustification: [ai.priority_justification, ...ruleHits].filter(Boolean).join(' | '),\n    product: ai.product || '',\n    suggestedDepartment: suggestedDept,\n    tags,\n    confidence,\n    needsReview,\n    validationNotes: notes.join('; '),\n    assignedTeam: TEAM_MAP[category] || 'Triage',\n    slaHours: SLA_HOURS[priority],\n    status: 'Open',\n    messageId: email.messageId,\n    threadId: email.threadId,\n    receivedAt: email.receivedAt,\n  },\n};"
+      },
+      "id": "wf1-validate",
+      "name": "Validate & Normalize",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1320, 0]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblf5GXP6JDw6G3GN" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Ticket ID": "={{ $json.ticketId }}",
+            "Customer Name": "={{ $json.customerName }}",
+            "Company": "={{ $json.company }}",
+            "Sender Email": "={{ $json.senderEmail }}",
+            "Email Subject": "={{ $json.subject }}",
+            "Email Body": "={{ $json.body }}",
+            "Issue Summary": "={{ $json.issueSummary }}",
+            "Detailed Description": "={{ $json.detailedDescription }}",
+            "Category": "={{ $json.category }}",
+            "Priority": "={{ $json.priority }}",
+            "Priority Justification": "={{ $json.priorityJustification }}",
+            "Sentiment": "={{ $json.sentiment }}",
+            "Product": "={{ $json.product }}",
+            "Suggested Department": "={{ $json.suggestedDepartment }}",
+            "Tags": "={{ $json.tags }}",
+            "Confidence Score": "={{ $json.confidence }}",
+            "Needs Review": "={{ $json.needsReview }}",
+            "Assigned Team": "={{ $json.assignedTeam }}",
+            "Status": "Open",
+            "Internal Notes": "={{ $json.validationNotes }}",
+            "Message ID": "={{ $json.messageId }}",
+            "Thread ID": "={{ $json.threadId }}",
+            "Received At": "={{ $json.receivedAt }}",
+            "SLA Hours": "={{ $json.slaHours }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": { "typecast": true }
+      },
+      "id": "wf1-create-ticket",
+      "name": "Create Ticket",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [1540, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    },
+    {
+      "parameters": {
+        "jsCode": "// ---- Prep attachments for Airtable content upload (base64, <=5MB) ----\nconst out = [];\nconst created = $input.all();\nconst metas = $('Extract Metadata').all();\nfor (let i = 0; i < created.length; i++) {\n  const recordId = created[i].json.id;\n  const bin = (metas[i] && metas[i].binary) || {};\n  for (const key of Object.keys(bin)) {\n    const b = bin[key];\n    if (!b || !b.data) continue; // filesystem-mode binary not supported by this simple path\n    if (Buffer.from(b.data, 'base64').length > 5 * 1024 * 1024) continue; // Airtable free-tier limit\n    out.push({ json: { recordId, contentType: b.mimeType || 'application/octet-stream', filename: b.fileName || key, file: b.data } });\n  }\n}\nreturn out; // empty array = no attachments, downstream node simply does not run"
+      },
+      "id": "wf1-prep-attach",
+      "name": "Prep Attachments",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [1760, -160]
+    },
+    {
+      "parameters": {
+        "method": "POST",
+        "url": "=https://content.airtable.com/v0/app1iEDHz2HsvKynN/{{ $json.recordId }}/Attachments/uploadAttachment",
+        "authentication": "genericCredentialType",
+        "genericAuthType": "httpHeaderAuth",
+        "sendBody": true,
+        "specifyBody": "json",
+        "jsonBody": "={{ JSON.stringify({ contentType: $json.contentType, file: $json.file, filename: $json.filename }) }}",
+        "options": { "timeout": 30000 }
+      },
+      "id": "wf1-upload-attach",
+      "name": "Upload Attachment",
+      "type": "n8n-nodes-base.httpRequest",
+      "typeVersion": 4.2,
+      "position": [1980, -160],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": { "httpHeaderAuth": { "id": "uqMuSNcupG5seQS9", "name": "Airtable PAT (Bearer header)" } }
+    },
+    {
+      "parameters": {
+        "conditions": {
+          "options": { "caseSensitive": true, "leftValue": "", "typeValidation": "loose" },
+          "conditions": [
+            {
+              "leftValue": "={{ $('Validate & Normalize').item.json.validEmail && !$('Validate & Normalize').item.json.tags.includes('possible-spam') }}",
+              "rightValue": "",
+              "operator": { "type": "boolean", "operation": "true", "singleValue": true }
+            }
+          ],
+          "combinator": "and"
+        },
+        "options": {}
+      },
+      "id": "wf1-if-ack",
+      "name": "Send Ack?",
+      "type": "n8n-nodes-base.if",
+      "typeVersion": 2.2,
+      "position": [1760, 60]
+    },
+    {
+      "parameters": {
+        "sendTo": "={{ $('Validate & Normalize').item.json.senderEmail }}",
+        "subject": "=[{{ $('Validate & Normalize').item.json.ticketId }}] We've received your request: {{ $('Validate & Normalize').item.json.issueSummary.slice(0, 60) }}",
+        "emailType": "text",
+        "message": "=Hi {{ $('Validate & Normalize').item.json.customerName || 'there' }},\n\nThanks for contacting support. Your request has been received and a ticket has been created:\n\n  Ticket ID:  {{ $('Validate & Normalize').item.json.ticketId }}\n  Summary:    {{ $('Validate & Normalize').item.json.issueSummary }}\n  Status:     Open\n  Est. first response: within {{ $('Validate & Normalize').item.json.slaHours }} business hours\n\nOur {{ $('Validate & Normalize').item.json.assignedTeam }} team is on it. Reply to this email to add details - your reply will attach to the same ticket.\n\n- Support Team (automated confirmation)",
+        "options": { "appendAttribution": false }
+      },
+      "id": "wf1-send-ack",
+      "name": "Send Acknowledgment",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [1980, 20],
+      "retryOnFail": true,
+      "maxTries": 2,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": { "gmailOAuth2": { "id": "5JpQggFa441vQuLb", "name": "Gmail account" } }
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "addLabels",
+        "messageId": "={{ $('Extract Metadata').item.json.messageId }}",
+        "labelIds": ["Label_408584879231155657"]
+      },
+      "id": "wf1-mark-processed",
+      "name": "Mark Processed",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [2420, 60],
+      "onError": "continueRegularOutput",
+      "credentials": { "gmailOAuth2": { "id": "5JpQggFa441vQuLb", "name": "Gmail account" } }
+    }
+  ],
+  "connections": {
+    "Gmail Trigger": { "main": [[{ "node": "Extract Metadata", "type": "main", "index": 0 }]] },
+    "Extract Metadata": { "main": [[{ "node": "Idempotency Check", "type": "main", "index": 0 }]] },
+    "Idempotency Check": { "main": [[{ "node": "New Email?", "type": "main", "index": 0 }]] },
+    "New Email?": {
+      "main": [
+        [{ "node": "Build AI Request", "type": "main", "index": 0 }],
+        [{ "node": "Skip (Already Processed)", "type": "main", "index": 0 }]
+      ]
+    },
+    "Build AI Request": { "main": [[{ "node": "AI Analysis (Groq)", "type": "main", "index": 0 }]] },
+    "AI Analysis (Groq)": {
+      "main": [
+        [{ "node": "Validate & Normalize", "type": "main", "index": 0 }],
+        [{ "node": "AI Fallback (Mistral)", "type": "main", "index": 0 }]
+      ]
+    },
+    "AI Fallback (Mistral)": {
+      "main": [
+        [{ "node": "Validate & Normalize", "type": "main", "index": 0 }],
+        [{ "node": "Validate & Normalize", "type": "main", "index": 0 }]
+      ]
+    },
+    "Validate & Normalize": { "main": [[{ "node": "Create Ticket", "type": "main", "index": 0 }]] },
+    "Create Ticket": {
+      "main": [
+        [
+          { "node": "Prep Attachments", "type": "main", "index": 0 },
+          { "node": "Send Ack?", "type": "main", "index": 0 }
+        ]
+      ]
+    },
+    "Prep Attachments": { "main": [[{ "node": "Upload Attachment", "type": "main", "index": 0 }]] },
+    "Send Ack?": {
+      "main": [
+        [{ "node": "Send Acknowledgment", "type": "main", "index": 0 }],
+        [{ "node": "Mark Processed", "type": "main", "index": 0 }]
+      ]
+    },
+    "Send Acknowledgment": { "main": [[{ "node": "Mark Processed", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "instanceId": "exported" },
+  "tags": []
+}

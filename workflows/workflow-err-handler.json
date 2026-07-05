@@ -1,0 +1,61 @@
+{
+  "name": "WF-ERR - Central Error Handler",
+  "nodes": [
+    {
+      "parameters": {},
+      "id": "wferr-trigger",
+      "name": "Error Trigger",
+      "type": "n8n-nodes-base.errorTrigger",
+      "typeVersion": 1,
+      "position": [0, 0]
+    },
+    {
+      "parameters": {
+        "mode": "runOnceForEachItem",
+        "jsCode": "// ---- Flatten n8n error payload for logging ----\nconst j = $json;\nconst err = j.execution && j.execution.error ? j.execution.error : {};\nlet snapshot = '';\ntry {\n  snapshot = JSON.stringify(j, null, 2).slice(0, 90000); // Airtable long-text safety cap\n} catch (_) {\n  snapshot = 'payload not serializable';\n}\nreturn {\n  json: {\n    workflowName: (j.workflow && j.workflow.name) || 'unknown',\n    nodeName: (err.node && err.node.name) || err.nodeName || 'unknown',\n    errorMessage: err.message || 'unknown error',\n    executionUrl: (j.execution && j.execution.url) || '',\n    snapshot,\n  },\n};"
+      },
+      "id": "wferr-format",
+      "name": "Format Error",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [220, 0]
+    },
+    {
+      "parameters": {
+        "operation": "create",
+        "base": { "__rl": true, "mode": "id", "value": "app1iEDHz2HsvKynN" },
+        "table": { "__rl": true, "mode": "id", "value": "tblKZLxgH109AAnPI" },
+        "columns": {
+          "mappingMode": "defineBelow",
+          "value": {
+            "Workflow": "={{ $json.workflowName }}",
+            "Node": "={{ $json.nodeName }}",
+            "Error Message": "={{ $json.errorMessage }}",
+            "Payload Snapshot": "={{ $json.snapshot }}"
+          },
+          "matchingColumns": [],
+          "schema": []
+        },
+        "options": { "typecast": true }
+      },
+      "id": "wferr-log",
+      "name": "Log to Errors Table",
+      "type": "n8n-nodes-base.airtable",
+      "typeVersion": 2.1,
+      "position": [440, 0],
+      "retryOnFail": true,
+      "maxTries": 3,
+      "waitBetweenTries": 2000,
+      "onError": "continueRegularOutput",
+      "credentials": { "airtableTokenApi": { "id": "wa1XOYIi3YAwRiRn", "name": "Airtable PAT" } }
+    }
+  ],
+  "connections": {
+    "Error Trigger": { "main": [[{ "node": "Format Error", "type": "main", "index": 0 }]] },
+    "Format Error": { "main": [[{ "node": "Log to Errors Table", "type": "main", "index": 0 }]] }
+  },
+  "settings": { "executionOrder": "v1" },
+  "pinData": {},
+  "meta": { "instanceId": "exported" },
+  "tags": []
+}
