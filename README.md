@@ -26,35 +26,35 @@ Built on **n8n** (self-hosted, local) with **Groq** as the primary LLM provider 
 ## 1. Architecture Overview
 
 ```
-┌─────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐
+┌─────────────┐    ┌──────────────┐   ┌──────────────┐    ┌──────────────────┐
 │ Gmail Inbox │──▶│ Gmail Trigger│──▶│ Extract Meta │──▶│ AI Analysis      │
-│ (support@)  │   │ (poll 1 min) │   │ + Attachments│   │ Groq ─▶ Mistral  │
-└─────────────┘   └──────────────┘   └──────────────┘   └────────┬─────────┘
+│ (support@)  │    │ (poll 1 min) │   │ + Attachments│    │ Groq ─▶ Mistral │
+└─────────────┘    └──────────────┘   └──────────────┘    └────────┬─────────┘
                                                                  │
       ┌──────────────────────────────────────────────────────────┘
       ▼
-┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+┌──────────────┐    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
 │ Validate &   │──▶│ Create Ticket│──▶│ Upload       │   │ Acknowledge  │
-│ Normalize    │   │ (Airtable)   │──▶│ Attachments  │   │ Customer     │
-└──────────────┘   └──────────────┘   └──────────────┘   └──────┬───────┘
+│ Normalize    │    │ (Airtable)   │──▶│ Attachments  │   │ Customer     │
+└──────────────┘    └──────────────┘   └──────────────┘   └──────┬───────┘
                                                                 │
                                                      ┌──────────▼───────┐
                                                      │ Mark "Processed" │
                                                      │ (Gmail label)    │
                                                      └──────────────────┘
 
-┌───────────────────────  WF2: Lifecycle & Audit  ────────────────────────┐
+┌───────────────────────  WF2: Lifecycle & Audit  ─────────────────────────┐
 │ Airtable "Last Updated" trigger ─▶ Snapshot diff ─▶ Append Audit Log    │
-│                                  └▶ Status→Resolved: resolution email   │
+│                                  └▶ Status→Resolved: resolution email    │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────  WF3: SLA Monitor  ──────────────────────────────┐
-│ Cron (15 min) ─▶ Query open tickets past SLA ─▶ Escalate priority       │
-└──────────────────────────────────────────────────────────────────────────┘
+│ Cron (15 min) ─▶ Query open tickets past SLA ─▶ Escalate priority      │
+└─────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────  WF-ERR: Error Handler  ─────────────────────────┐
-│ n8n Error Trigger ─▶ Flatten error payload ─▶ Log to Airtable "Errors"  │
-└──────────────────────────────────────────────────────────────────────────┘
+│ n8n Error Trigger ─▶ Flatten error payload ─▶ Log to Airtable "Errors" │
+└─────────────────────────────────────────────────────────────────────────┘
 ```
 
 Four independent workflows share one Airtable base:
