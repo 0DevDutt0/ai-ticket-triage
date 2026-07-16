@@ -1,8 +1,24 @@
 # AI Customer Support Ticket Automation
 
+![Cost](https://img.shields.io/badge/running%20cost-%240-brightgreen)
+![Orchestration](https://img.shields.io/badge/orchestration-n8n-EA4B71)
+![Primary LLM](https://img.shields.io/badge/primary%20LLM-Groq-F55036)
+![Fallback LLM](https://img.shields.io/badge/fallback%20LLM-Mistral-FA520F)
+![Database](https://img.shields.io/badge/database-Airtable-18BFFF)
+![Setup](https://img.shields.io/badge/setup-Python%203-3776AB)
+
 An end-to-end, zero-cost support-ticket automation system. Incoming customer emails are ingested from a Gmail inbox, triaged by a large language model, validated against strict business rules, stored as structured tickets in Airtable, and acknowledged automatically — with a full audit trail, SLA-breach escalation, and centralized error logging.
 
 Built on **n8n** (self-hosted, local) with **Groq** as the primary LLM provider and **Mistral** as an automatic fallback.
+
+## Highlights
+
+- 🤖 **AI triage** — every inbound email is classified into category, priority, sentiment, and routing in one deterministic LLM call, with automatic Groq → Mistral failover.
+- 🛡️ **Never-throw validation** — AI output is treated as untrusted input; fuzzy enum normalization, deterministic priority overrides, and safe defaults mean a ticket is *always* created, even on a double LLM outage.
+- 📋 **Full audit trail** — every agent edit in Airtable is diffed and logged automatically, with resolution emails fired on status change.
+- ⏱️ **SLA escalation** — open tickets past their first-response SLA are auto-escalated on a 15-minute cycle, edge-triggered and monotonic.
+- 🧾 **Centralized error logging** — any workflow failure is captured, flattened, and written to a queryable `Errors` table.
+- 💸 **$0 running cost** — no Docker, no paid tiers, no local model serving; everything runs on free tiers of n8n, Groq, Mistral, and Airtable.
 
 ---
 
@@ -20,41 +36,43 @@ Built on **n8n** (self-hosted, local) with **Groq** as the primary LLM provider 
 10. [Security Notes](#10-security-notes)
 11. [Repository Layout](#11-repository-layout)
 12. [Assumptions & Limitations](#12-assumptions--limitations)
+13. [Contributing](#13-contributing)
+14. [License](#14-license)
 
 ---
 
 ## 1. Architecture Overview
 
 ```
-┌─────────────┐    ┌──────────────┐   ┌──────────────┐    ┌──────────────────┐
+┌─────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────────┐
 │ Gmail Inbox │──▶│ Gmail Trigger│──▶│ Extract Meta │──▶│ AI Analysis      │
-│ (support@)  │    │ (poll 1 min) │   │ + Attachments│    │ Groq ─▶ Mistral │
-└─────────────┘    └──────────────┘   └──────────────┘    └────────┬─────────┘
+│ (support@)  │   │ (poll 1 min) │   │ + Attachments│   │ Groq ─▶ Mistral  │
+└─────────────┘   └──────────────┘   └──────────────┘   └────────┬─────────┘
                                                                  │
       ┌──────────────────────────────────────────────────────────┘
       ▼
-┌──────────────┐    ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
+┌──────────────┐   ┌──────────────┐   ┌──────────────┐   ┌──────────────┐
 │ Validate &   │──▶│ Create Ticket│──▶│ Upload       │   │ Acknowledge  │
-│ Normalize    │    │ (Airtable)   │──▶│ Attachments  │   │ Customer     │
-└──────────────┘    └──────────────┘   └──────────────┘   └──────┬───────┘
+│ Normalize    │   │ (Airtable)   │──▶│ Attachments  │   │ Customer     │
+└──────────────┘   └──────────────┘   └──────────────┘   └──────┬───────┘
                                                                 │
                                                      ┌──────────▼───────┐
                                                      │ Mark "Processed" │
                                                      │ (Gmail label)    │
                                                      └──────────────────┘
 
-┌───────────────────────  WF2: Lifecycle & Audit  ─────────────────────────┐
+┌───────────────────────  WF2: Lifecycle & Audit  ────────────────────────┐
 │ Airtable "Last Updated" trigger ─▶ Snapshot diff ─▶ Append Audit Log    │
-│                                  └▶ Status→Resolved: resolution email    │
+│                                  └▶ Status→Resolved: resolution email   │
 └──────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────  WF3: SLA Monitor  ──────────────────────────────┐
-│ Cron (15 min) ─▶ Query open tickets past SLA ─▶ Escalate priority      │
-└─────────────────────────────────────────────────────────────────────────┘
+│ Cron (15 min) ─▶ Query open tickets past SLA ─▶ Escalate priority       │
+└──────────────────────────────────────────────────────────────────────────┘
 
 ┌───────────────────────  WF-ERR: Error Handler  ─────────────────────────┐
-│ n8n Error Trigger ─▶ Flatten error payload ─▶ Log to Airtable "Errors" │
-└─────────────────────────────────────────────────────────────────────────┘
+│ n8n Error Trigger ─▶ Flatten error payload ─▶ Log to Airtable "Errors"  │
+└──────────────────────────────────────────────────────────────────────────┘
 ```
 
 Four independent workflows share one Airtable base:
@@ -93,6 +111,8 @@ Design constraint: **$0 running cost, no Docker, no paid tiers, no local model s
 
 ### WF1 — Support Ticket Intake (11 nodes)
 
+![WF1 — Support Ticket Intake](Demo/n8n/WF1.png)
+
 1. **Gmail Trigger** — polls the support inbox every minute for messages in `INBOX` without the `processed` label. Attachment download enabled, so file binaries flow through the pipeline.
 2. **Extract Metadata** (Code) — parses the sender's display name and address from the `From` header (regex with RFC-822 fallback), extracts subject and plaintext body (falling back to tag-stripped HTML), captures `messageId`, `threadId`, and ISO-normalized `receivedAt`. The body is truncated to 8,000 characters for the LLM while the full body is preserved for storage.
 3. **Idempotency Check** (Airtable search) — queries `{Message ID} = '<gmail id>'`. If a ticket already exists, the run short-circuits to a No-Op node. This makes the pipeline safe against re-polls, n8n restarts, and manual re-executions.
@@ -107,6 +127,8 @@ Design constraint: **$0 running cost, no Docker, no paid tiers, no local model s
 
 ### WF2 — Ticket Lifecycle & Audit Trail (6 nodes)
 
+![WF2 — Ticket Lifecycle & Audit Trail](Demo/n8n/WF2.png)
+
 1. **Airtable Trigger** — polls the `Last Updated` (last-modified-time) field on the Tickets table every minute; only changed records flow through.
 2. **Diff Against Snapshot** (Code) — a stateful field-level differ; see §5.2.
 3. **Append Audit Log** (Airtable create) — one row per changed field: ticket link, field name, old value, new value, changed-by.
@@ -116,12 +138,16 @@ Design constraint: **$0 running cost, no Docker, no paid tiers, no local model s
 
 ### WF3 — SLA Monitor & Escalation (4 nodes)
 
+![WF3 — SLA Monitor & Escalation](Demo/n8n/WF3.png)
+
 1. **Schedule Trigger** — every 15 minutes.
 2. **Find SLA-Breached Tickets** (Airtable search) — formula: `AND({Status}='Open', {Escalated}=0, DATETIME_DIFF(NOW(), {Received At}, 'hours') >= {SLA Hours})`.
 3. **Compute Escalation** (Code) — bumps priority one level (`Low → Medium → High → Critical`, capped), computes ticket age, and appends a timestamped `[SLA]` note.
 4. **Escalate Ticket** (Airtable update) — writes the new priority, sets `Escalated` (preventing repeat escalation), and updates internal notes.
 
 ### WF-ERR — Central Error Handler (3 nodes)
+
+![WF-ERR — Central Error Handler](Demo/n8n/WF-ErrorHandler.png)
 
 1. **Error Trigger** — fires automatically whenever WF1/WF2/WF3 fails (wired via each workflow's `errorWorkflow` setting).
 2. **Format Error** (Code) — flattens n8n's error payload: workflow name, failing node, message, execution URL, and a JSON snapshot capped at 90 KB (Airtable long-text safety limit).
@@ -304,11 +330,10 @@ All secrets live in `.env` (git-ignored — never commit it):
 
 ```
 ├── README.md                        ← this file
-├── DEMO.md                          ← guided demo walkthrough
-├── TICKET-AUTOMATION-WORKING.md     ← full design/working document
 ├── .env                             ← secrets (git-ignored)
 ├── .gitignore
 ├── setup_airtable.py                ← one-shot provisioning + import script
+├── Demo/                            ← demo screenshots (Gmail, n8n workflows)
 └── workflows/
     ├── workflow-1-intake.json       ← WF1: Ticket Intake
     ├── workflow-2-lifecycle.json    ← WF2: Lifecycle & Audit Trail
@@ -326,3 +351,17 @@ All secrets live in `.env` (git-ignored — never commit it):
 - **Attachments** over 5 MB are skipped (Airtable free-tier per-file cap).
 - **Thread replies**: a customer reply on an existing thread carries a new message id and will create a new ticket unless duplicate-detection-by-thread is enabled; `Thread ID` is stored to support that extension.
 - **WF2 snapshot state** persists only while the workflow is *active* (n8n static-data semantics); manual test runs seed the snapshot but do not diff.
+
+---
+
+## 13. Contributing
+
+Issues and pull requests are welcome. Before opening one:
+
+- Export any workflow changes from n8n (`Download` → JSON) and commit the updated file(s) under `workflows/`.
+- Never commit `.env`, real API keys, or exported credentials.
+- Keep new workflow nodes documented in §3 and, if they change failure behavior, in §7.
+
+## 14. License
+
+No license has been specified for this repository yet. Until one is added, all rights are reserved by the author — add a `LICENSE` file (e.g. MIT, Apache-2.0) to make reuse terms explicit.
